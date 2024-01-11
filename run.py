@@ -10,6 +10,10 @@ import tempfile
 import time
 from pathlib import Path
 
+import sys 
+sys.path.append('/home/yanan/benchmark/utils_openai/')
+import openai_func
+
 import openai
 
 from agent import (
@@ -141,6 +145,7 @@ def config() -> argparse.Namespace:
     # example config
     parser.add_argument("--test_start_idx", type=int, default=0)
     parser.add_argument("--test_end_idx", type=int, default=1000)
+    parser.add_argument("--spec", type=str, default="")
 
     # logging related
     parser.add_argument("--result_dir", type=str, default="")
@@ -159,8 +164,7 @@ def config() -> argparse.Namespace:
 
 
 def early_stop(
-    trajectory: Trajectory, max_steps: int, thresholds: dict[str, int]
-) -> tuple[bool, str]:
+    trajectory: Trajectory, max_steps: int, thresholds: dict[str, int]) -> tuple[bool, str]:
     """Check whether need to early stop"""
 
     # reach the max step
@@ -240,7 +244,11 @@ def test(
         sleep_after_execution=args.sleep_after_execution,
     )
 
+    # print('config_file_list===>', config_file_list)
+
     for config_file in config_file_list:
+        if args.spec and  config_file.split('/')[-1] != args.spec:
+            continue
         try:
             render_helper = RenderHelper(
                 config_file, args.result_dir, args.action_set_tag
@@ -251,6 +259,9 @@ def test(
                 _c = json.load(f)
                 intent = _c["intent"]
                 task_id = _c["task_id"]
+                site = _c['sites']
+                print("task===>", task_id, site)
+
                 # automatically login
                 if _c["storage_state"]:
                     cookie_file_name = os.path.basename(_c["storage_state"])
@@ -275,6 +286,7 @@ def test(
                         json.dump(_c, f)
 
             logger.info(f"[Config file]: {config_file}")
+            logger.info(f"[sites]: {site[0]}")
             logger.info(f"[Intent]: {intent}")
 
             agent.reset(config_file)
@@ -296,8 +308,10 @@ def test(
                         action = agent.next_action(
                             trajectory, intent, meta_data=meta_data
                         )
+
                     except ValueError as e:
                         # get the error message
+                        print(e)
                         action = create_stop_action(f"ERROR: {str(e)}")
 
                 trajectory.append(action)
@@ -315,14 +329,21 @@ def test(
                 )
                 meta_data["action_history"].append(action_str)
 
+                print("action===>", action)
+                print("action_str===>", action_str)
                 if action["action_type"] == ActionTypes.STOP:
+                    logger.info(f"action_type===>: {ActionTypes.STOP} earlystop:{early_stop_flag}")
+                    print('action_type===>', action["action_type"], 'earlystop===>', early_stop_flag)
                     break
 
                 obs, _, terminated, _, info = env.step(action)
                 state_info = {"observation": obs, "info": info}
                 trajectory.append(state_info)
+                # print("actions in trajectory==>", action)
 
                 if terminated:
+                    logger.info(f"terminated===>: {terminated}")
+                    print('terminated:', terminated)
                     # add a action place holder
                     trajectory.append(create_stop_action(""))
                     break
@@ -334,21 +355,24 @@ def test(
                 page=env.page,
                 client=env.get_page_client(env.page),
             )
+            print('evaluation score:', score)
 
             scores.append(score)
 
-            if score == 1:
-                logger.info(f"[Result] (PASS) {config_file}")
-            else:
-                logger.info(f"[Result] (FAIL) {config_file}")
+            fin = 'PASS' if score == 1 else 'FAIL'
+
+            logger.info(f"task===>{task_id} [Result] ({fin}) {config_file}")
+            render_helper.render_final(f'[Result] ({fin})')
 
             if args.save_trace_enabled:
                 env.save_trace(
                     Path(args.result_dir) / "traces" / f"{task_id}.zip"
                 )
+            print('-'*50 + '\n')
 
         except openai.error.OpenAIError as e:
             logger.info(f"[OpenAI Error] {repr(e)}")
+            fin = 'ERROR'
         except Exception as e:
             logger.info(f"[Unhandled Error] {repr(e)}]")
             import traceback
@@ -358,8 +382,14 @@ def test(
                 f.write(f"[Config file]: {config_file}\n")
                 f.write(f"[Unhandled Error] {repr(e)}\n")
                 f.write(traceback.format_exc())  # write stack trace to file
+            fin = 'ERROR'
 
         render_helper.close()
+        old_html_name = "./{}/render_{}.html".format(args.result_dir, task_id)
+        new_html_name = "./{}/render_{}__{}.html".format(args.result_dir, task_id, fin)
+
+        os.system('mv {} {}'.format(old_html_name, new_html_name))
+        logger.info('\n')
 
     env.close()
     logger.info(f"Average score: {sum(scores) / len(scores)}")
@@ -419,8 +449,12 @@ if __name__ == "__main__":
     test_file_list = []
     st_idx = args.test_start_idx
     ed_idx = args.test_end_idx
-    for i in range(st_idx, ed_idx):
-        test_file_list.append(f"config_files/{i}.json")
+
+    test_file_list = [f for f in glob.glob("./config_files/*.json") if 'test' not in f]
+    random.shuffle(test_file_list)
+
+    # for i in range(st_idx, ed_idx):
+    #     test_file_list.append(f"config_files/{i}.json")
     if "debug" not in args.result_dir:
         test_file_list = get_unfinished(test_file_list, args.result_dir)
 
@@ -430,7 +464,7 @@ if __name__ == "__main__":
         print(f"Total {len(test_file_list)} tasks left")
         args.render = False
         args.render_screenshot = True
-        args.save_trace_enabled = True
+        args.save_trace_enabled = False
 
         args.current_viewport_only = True
         dump_config(args)
